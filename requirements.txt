@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+scikit-learn
+lightgbm
+fairlearn
+shap
+codecarbon
+psutil
+joblib
