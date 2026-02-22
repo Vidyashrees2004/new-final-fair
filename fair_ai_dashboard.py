@@ -9,7 +9,6 @@ import psutil
 from lightgbm import LGBMClassifier
 from fairlearn.reductions import ExponentiatedGradient, DemographicParity
 from fairlearn.metrics import demographic_parity_difference
-from sklearn.model_selection import train_test_split
 from codecarbon import EmissionsTracker
 
 st.set_page_config(page_title="Fair AI Dashboard", layout="wide")
@@ -17,9 +16,9 @@ st.set_page_config(page_title="Fair AI Dashboard", layout="wide")
 st.title("🎯 Fair AI Income Prediction")
 st.markdown("Baseline vs Fair Model • Explainability • Energy Tracking")
 
-# ==================================================
-# LOAD BASELINE + SCALER
-# ==================================================
+# ======================================
+# Load baseline + scaler
+# ======================================
 
 @st.cache_resource
 def load_assets():
@@ -30,9 +29,9 @@ def load_assets():
 
 baseline_model, scaler, features = load_assets()
 
-# ==================================================
-# TRAIN FAIR MODEL (NO SAVED PKL)
-# ==================================================
+# ======================================
+# Re-Train Fair Model at Runtime
+# ======================================
 
 @st.cache_resource
 def train_fair_model():
@@ -63,20 +62,20 @@ def train_fair_model():
 
     X_scaled = scaler.transform(X)
 
-    fair = ExponentiatedGradient(
+    fair_model = ExponentiatedGradient(
         LGBMClassifier(n_estimators=100, random_state=42),
         constraints=DemographicParity()
     )
 
-    fair.fit(X_scaled, y, sensitive_features=sens)
+    fair_model.fit(X_scaled, y, sensitive_features=sens)
 
-    return fair, X_scaled, y, sens
+    return fair_model, X_scaled, y, sens
 
 fair_model, X_full_scaled, y_full, sens_full = train_fair_model()
 
-# ==================================================
-# SIDEBAR
-# ==================================================
+# ======================================
+# Sidebar Inputs
+# ======================================
 
 st.sidebar.header("Input Features")
 
@@ -92,9 +91,9 @@ race_num = 1 if race == "White" else 0
 model_choice = st.sidebar.radio("Choose Model", ["Baseline", "Fair Model"])
 run = st.sidebar.button("Run Prediction")
 
-# ==================================================
-# PREDICTION
-# ==================================================
+# ======================================
+# Prediction
+# ======================================
 
 if run:
 
@@ -104,54 +103,43 @@ if run:
     tracker = EmissionsTracker(save_to_file=False)
     tracker.start()
 
-    start_time = time.time()
-    start_cpu = psutil.cpu_percent(interval=None)
+    start = time.time()
 
-    # ------------------ BASELINE ------------------ #
     if model_choice == "Baseline":
         prediction = baseline_model.predict(scaled_data)[0]
         probability = baseline_model.predict_proba(scaled_data)[0][1]
         shap_model = baseline_model
+        explain_title = "🧠 Explainability"
 
-    # ------------------ FAIR MODEL ---------------- #
     else:
         prediction = fair_model.predict(scaled_data)[0]
         probability = fair_model._pmf_predict(scaled_data)[0][1]
 
-        # Explain base decision (SHAP cannot explain ensemble reducer directly)
+        # Use baseline for explanation (fairlearn wrapper not SHAP compatible)
         shap_model = baseline_model
+        explain_title = "🧠 Explainability (Raw Model Before Fairness Adjustment)"
 
-    inference_time = time.time() - start_time
+    inference_time = time.time() - start
     emissions = tracker.stop()
-    cpu_usage = psutil.cpu_percent(interval=None)
 
-    # ==================================================
-    # DISPLAY RESULTS
-    # ==================================================
-
-    st.markdown("---")
-    st.subheader("📊 Prediction Result")
-
+    # Result Display
     if prediction == 1:
         st.success("💰 HIGH Income (>50K)")
     else:
         st.info("📉 LOW Income (≤50K)")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     col1.metric("Confidence", f"{probability:.2%}")
     col2.metric("Inference Time (ms)", f"{inference_time*1000:.2f}")
-    col3.metric("CPU Usage (%)", f"{cpu_usage:.2f}")
 
     st.metric("CO₂ Emission (kg)", f"{emissions:.8f}")
 
-    # ==================================================
-    # SHAP EXPLAINABILITY
-    # ==================================================
+    # ======================================
+    # SHAP Explainability
+    # ======================================
 
-    if model_choice == "Fair Model":
-        st.subheader("🧠 Explainability (Before Fairness Adjustment)")
-    else:
-        st.subheader("🧠 Explainability")
+    st.markdown("---")
+    st.subheader(explain_title)
 
     explainer = shap.Explainer(shap_model)
     shap_values = explainer(scaled_data)
@@ -163,18 +151,15 @@ if run:
 
     st.bar_chart(shap_df.set_index("Feature"))
 
-    strongest_positive = shap_df.iloc[-1]["Feature"]
-    strongest_negative = shap_df.iloc[0]["Feature"]
+    st.write("🔺 Most Positive Factor:", shap_df.iloc[-1]["Feature"])
+    st.write("🔻 Most Negative Factor:", shap_df.iloc[0]["Feature"])
 
-    st.write(f"🔺 Strongest factor increasing income: **{strongest_positive}**")
-    st.write(f"🔻 Strongest factor decreasing income: **{strongest_negative}**")
-
-# ==================================================
-# FAIRNESS METRICS SECTION
-# ==================================================
+# ======================================
+# Fairness Metrics
+# ======================================
 
 st.markdown("---")
-st.header("📊 Model Fairness Comparison")
+st.header("📊 Fairness Comparison")
 
 fair_pred = fair_model.predict(X_full_scaled)
 baseline_pred = baseline_model.predict(X_full_scaled)
@@ -188,10 +173,8 @@ fair_gap = demographic_parity_difference(
 )
 
 colA, colB = st.columns(2)
-colA.metric("Baseline Demographic Parity Gap", f"{baseline_gap:.4f}")
-colB.metric("Fair Model Demographic Parity Gap", f"{fair_gap:.4f}")
+colA.metric("Baseline Gap", f"{baseline_gap:.4f}")
+colB.metric("Fair Model Gap", f"{fair_gap:.4f}")
 
 if fair_gap < baseline_gap:
-    st.success("✅ Fair model reduces group disparity")
-else:
-    st.warning("⚠️ Fairness improvement not significant")
+    st.success("✅ Fair model reduces demographic disparity")
