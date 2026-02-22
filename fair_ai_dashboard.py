@@ -8,55 +8,76 @@ import psutil
 
 from lightgbm import LGBMClassifier
 from fairlearn.reductions import ExponentiatedGradient, DemographicParity
+from fairlearn.metrics import demographic_parity_difference
+from sklearn.model_selection import train_test_split
 from codecarbon import EmissionsTracker
 
 st.set_page_config(page_title="Fair AI Dashboard", layout="wide")
 
 st.title("🎯 Fair AI Income Prediction")
-st.markdown("Explainability • Energy Tracking • Fairness")
+st.markdown("Baseline vs Fair Model • Explainability • Energy Tracking")
 
-# =================================
+# ======================================
 # Load baseline + scaler
-# =================================
+# ======================================
 
 @st.cache_resource
-def load_models():
-    return {
-        "baseline": joblib.load("models/baseline_model.pkl"),
-        "scaler": joblib.load("models/scaler.pkl"),
-        "features": joblib.load("models/feature_names.pkl"),
-    }
+def load_assets():
+    baseline = joblib.load("models/baseline_model.pkl")
+    scaler = joblib.load("models/scaler.pkl")
+    features = joblib.load("models/feature_names.pkl")
+    return baseline, scaler, features
 
-models = load_models()
+baseline_model, scaler, features = load_assets()
 
-# =================================
-# Train Fair Model at runtime
-# =================================
+# ======================================
+# Re-Train Fair Model at Runtime
+# ======================================
 
 @st.cache_resource
 def train_fair_model():
-    # small synthetic dataset for fairness constraint training
-    # (lightweight retraining using baseline as reference)
+
+    # Load dataset again for fairness training
+    url = "https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data"
+    df = pd.read_csv(url, header=None, na_values=" ?", skipinitialspace=True)
+
+    df.columns = [
+        'age', 'workclass', 'fnlwgt', 'education', 'education-num',
+        'marital-status', 'occupation', 'relationship', 'race', 'sex',
+        'capital-gain', 'capital-loss', 'hours-per-week',
+        'native-country', 'income'
+    ]
+
+    df = df.dropna()
+
+    df_fixed = pd.DataFrame()
+    df_fixed['age'] = df['age']
+    df_fixed['education-num'] = df['education-num']
+    df_fixed['hours-per-week'] = df['hours-per-week']
+    df_fixed['sex'] = (df['sex'] == 'Male').astype(int)
+    df_fixed['race'] = (df['race'] == 'White').astype(int)
+    df_fixed['income_binary'] = (df['income'] == '>50K').astype(int)
+
+    X = df_fixed[features]
+    y = df_fixed['income_binary']
+    sens = df_fixed['sex']
+
+    X_scaled = scaler.transform(X)
 
     fair_model = ExponentiatedGradient(
         LGBMClassifier(n_estimators=100, random_state=42),
         constraints=DemographicParity()
     )
 
-    # Create small synthetic balanced data
-    X_dummy = np.random.rand(500, 5)
-    y_dummy = np.random.randint(0, 2, 500)
-    sens_dummy = np.random.randint(0, 2, 500)
+    fair_model.fit(X_scaled, y, sensitive_features=sens)
 
-    fair_model.fit(X_dummy, y_dummy, sensitive_features=sens_dummy)
+    return fair_model, X_scaled, y, sens
 
-    return fair_model
+fair_model, X_full_scaled, y_full, sens_full = train_fair_model()
 
-fair_model_runtime = train_fair_model()
-
-# =================================
-# Sidebar
-# =================================
+# ======================================
+# Sidebar Inputs
+# ======================================
 
 st.sidebar.header("Input Features")
 
@@ -72,14 +93,14 @@ race_num = 1 if race == "White" else 0
 model_choice = st.sidebar.radio("Choose Model", ["Baseline", "Fair Model"])
 run = st.sidebar.button("Run Prediction")
 
-# =================================
-# Prediction
-# =================================
+# ======================================
+# Prediction Logic
+# ======================================
 
 if run:
 
     input_data = np.array([[age, education, hours, gender_num, race_num]])
-    scaled = models["scaler"].transform(input_data)
+    scaled_data = scaler.transform(input_data)
 
     tracker = EmissionsTracker(save_to_file=False)
     tracker.start()
@@ -88,21 +109,23 @@ if run:
     start_cpu = psutil.cpu_percent(interval=None)
 
     if model_choice == "Baseline":
-        model = models["baseline"]
-        prediction = model.predict(scaled)[0]
-        probability = model.predict_proba(scaled)[0][1]
-        shap_model = model
+        prediction = baseline_model.predict(scaled_data)[0]
+        probability = baseline_model.predict_proba(scaled_data)[0][1]
+        shap_model = baseline_model
+
     else:
-        model = fair_model_runtime
-        prediction = model.predict(scaled)[0]
-        probability = 0.5
-        shap_model = models["baseline"]  # Explain using baseline logic
+        prediction = fair_model.predict(scaled_data)[0]
+        probability = fair_model._pmf_predict(scaled_data)[0][1]
+        shap_model = fair_model.estimators_[0][1]
 
     inference_time = time.time() - start
     emissions = tracker.stop()
     cpu_usage = psutil.cpu_percent(interval=None)
 
+    # -------------------------
     # Result
+    # -------------------------
+
     if prediction == 1:
         st.success("💰 HIGH Income (>50K)")
     else:
@@ -113,18 +136,39 @@ if run:
     col2.metric("Time (ms)", f"{inference_time*1000:.2f}")
     col3.metric("CPU (%)", f"{cpu_usage:.2f}")
 
-    st.metric("CO₂ (kg)", f"{emissions:.8f}")
+    st.metric("CO₂ Emission (kg)", f"{emissions:.8f}")
 
-    # SHAP
+    # -------------------------
+    # SHAP Explainability
+    # -------------------------
+
     st.markdown("## 🧠 Explainability")
+
     explainer = shap.Explainer(shap_model)
-    shap_values = explainer(scaled)
+    shap_values = explainer(scaled_data)
 
     shap_df = pd.DataFrame({
-        "Feature": models["features"],
+        "Feature": features,
         "Impact": shap_values.values[0]
     }).sort_values("Impact")
 
     st.bar_chart(shap_df.set_index("Feature"))
 
-    st.write("Top Positive Factor:", shap_df.iloc[-1]["Feature"])
+    st.write("Most Positive Factor:", shap_df.iloc[-1]["Feature"])
+    st.write("Most Negative Factor:", shap_df.iloc[0]["Feature"])
+
+# ======================================
+# Fairness Metrics
+# ======================================
+
+st.markdown("---")
+st.header("📊 Fairness Comparison")
+
+fair_pred = fair_model.predict(X_full_scaled)
+baseline_pred = baseline_model.predict(X_full_scaled)
+
+baseline_gap = demographic_parity_difference(y_full, baseline_pred, sensitive_features=sens_full)
+fair_gap = demographic_parity_difference(y_full, fair_pred, sensitive_features=sens_full)
+
+st.write("Baseline Fairness Gap:", round(baseline_gap, 4))
+st.write("Fair Model Fairness Gap:", round(fair_gap, 4))
