@@ -152,7 +152,7 @@ if run:
     st.bar_chart(shap_df.set_index("Feature"))
 
     st.write("🔺 Most Positive Factor:", shap_df.iloc[-1]["Feature"])
-    st.write("🔻 Most Negative Factor:", shap_df.iloc[0]["Feature"])
+
 
 # ======================================
 # Fairness Metrics
